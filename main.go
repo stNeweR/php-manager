@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
 )
@@ -21,7 +22,6 @@ type Composer struct {
 var (
 	rootDir  string
 	composer Composer
-	allDirs  []string
 )
 
 func main() {
@@ -36,56 +36,66 @@ func main() {
 	data, _ := os.ReadFile(filepath.Join(rootDir, "composer.json"))
 	json.Unmarshal(data, &composer)
 
-	// Собираем все папки для автокомплита
-	allDirs = collectDirs(rootDir, composer.Autoload.PSR4)
+	km := huh.NewDefaultKeyMap()
+	km.Input.AcceptSuggestion = key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "complete"))
+	km.Input.Next = key.NewBinding(key.WithKeys("enter"), key.WithHelp("enter", "next"))
+	km.Input.Prev = key.NewBinding(key.WithKeys("shift+tab"), key.WithHelp("shift+tab", "back"))
 
-	// Форма
-	var kind, dir, name string
+	for {
+		var kind, dir, name string
+		var final bool
 
-	err := huh.NewForm(
-		huh.NewGroup(
-			huh.NewSelect[string]().
-				Title("Что создаём?").
-				Description("Выбери тип файла").
-				Options(
-					huh.NewOption("PHP Class", "class"),
-					huh.NewOption("PHP Interface", "interface"),
-					huh.NewOption("PHP Trait", "trait"),
-					huh.NewOption("PHP Enum", "enum"),
-					huh.NewOption("Laravel Controller", "controller"),
-					huh.NewOption("Laravel Model", "model"),
-					huh.NewOption("Laravel Middleware", "middleware"),
-					huh.NewOption("Laravel FormRequest", "request"),
-					huh.NewOption("Laravel Resource", "resource"),
-				).
-				Value(&kind),
-		),
-		huh.NewGroup(
-			huh.NewInput().
-				Title("Папка").
-				Description("Tab — автокомплит, стрелки — выбор, Enter — подтвердить").
-				Placeholder("app/Services").
-				Suggestions(allDirs).
-				Value(&dir),
-			huh.NewInput().
-				Title("Имя файла / класса").
-				Placeholder("UserService").
-				Value(&name),
-		),
-	).WithTheme(huh.ThemeCharm()).Run()
+		err := huh.NewForm(
+			huh.NewGroup(
+				huh.NewSelect[string]().
+					Title("Что создаём?").
+					Description("Выбери тип файла").
+					Options(
+						huh.NewOption("PHP Class", "class"),
+						huh.NewOption("PHP Interface", "interface"),
+						huh.NewOption("PHP Trait", "trait"),
+						huh.NewOption("PHP Enum", "enum"),
+						huh.NewOption("Laravel Controller", "controller"),
+						huh.NewOption("Laravel Model", "model"),
+						huh.NewOption("Laravel Middleware", "middleware"),
+						huh.NewOption("Laravel FormRequest", "request"),
+						huh.NewOption("Laravel Resource", "resource"),
+					).
+					Value(&kind),
+				huh.NewConfirm().
+					Title("Сделать класс final?").
+					Description("Применяется к class, controller, model, middleware, request, resource").
+					Value(&final),
+			),
+			huh.NewGroup(
+				huh.NewInput().
+					Title("Папка").
+					Description("↑↓ — выбор подсказки, Tab — принять, Enter — далее").
+					Placeholder("app/Services").
+					SuggestionsFunc(func() []string {
+						return suggestDirs(rootDir, dir)
+					}, &dir).
+					Value(&dir),
+				huh.NewInput().
+					Title("Имя файла / класса").
+					Placeholder("UserService").
+					Value(&name),
+			),
+		).WithTheme(huh.ThemeCharm()).WithKeyMap(km).Run()
 
-	if err != nil {
-		if errors.Is(err, huh.ErrUserAborted) {
-			fmt.Println("Отменено.")
-			return
+		if err != nil {
+			if errors.Is(err, huh.ErrUserAborted) {
+				fmt.Println("Отменено.")
+				return
+			}
+			fmt.Println("Ошибка:", err)
+			os.Exit(1)
 		}
-		fmt.Println("Ошибка:", err)
-		os.Exit(1)
-	}
 
-	if err := generate(kind, dir, name); err != nil {
-		fmt.Println(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("❌ " + err.Error()))
-		os.Exit(1)
+		if err := generate(kind, dir, name, final); err != nil {
+			fmt.Println(lipgloss.NewStyle().Foreground(lipgloss.Color("#FF5555")).Render("❌ " + err.Error()))
+			continue
+		}
 	}
 }
 
@@ -100,28 +110,6 @@ func findComposerRoot(start string) string {
 		}
 		start = parent
 	}
-}
-
-func collectDirs(root string, psr4 map[string]string) []string {
-	seen := map[string]bool{}
-	var out []string
-
-	for _, prefix := range psr4 {
-		base := filepath.Join(root, prefix)
-		filepath.WalkDir(base, func(path string, d os.DirEntry, err error) error {
-			if err != nil || !d.IsDir() {
-				return nil
-			}
-			rel, _ := filepath.Rel(root, path)
-			rel = filepath.ToSlash(rel)
-			if !seen[rel] {
-				seen[rel] = true
-				out = append(out, rel)
-			}
-			return nil
-		})
-	}
-	return out
 }
 
 func resolveNamespace(root, filePath string) string {
@@ -140,7 +128,7 @@ func resolveNamespace(root, filePath string) string {
 	return ""
 }
 
-func generate(kind, dir, name string) error {
+func generate(kind, dir, name string, final bool) error {
 	name = strings.TrimSuffix(name, ".php")
 	if name == "" {
 		return fmt.Errorf("имя не может быть пустым")
@@ -154,10 +142,11 @@ func generate(kind, dir, name string) error {
 	ns := resolveNamespace(rootDir, filePath)
 
 	var (
-		kindStr string
-		extends string
-		imports string
-		body    string
+		kindStr  string
+		extends  string
+		imports  string
+		body     string
+		finalStr string
 	)
 
 	switch kind {
@@ -207,20 +196,24 @@ func generate(kind, dir, name string) error {
 		kindStr, body = "class", "    //"
 	}
 
+	if final && kindStr == "class" {
+		finalStr = "final "
+	}
+
 	f, err := os.Create(filePath)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	fmt.Fprintf(f, "<?php\n\n")
+	fmt.Fprintf(f, "<?php\n\ndeclare(strict_types=1);\n\n")
 	if ns != "" {
 		fmt.Fprintf(f, "namespace %s;\n\n", ns)
 	}
 	if imports != "" {
 		fmt.Fprintf(f, "%s", imports)
 	}
-	fmt.Fprintf(f, "%s %s", kindStr, name)
+	fmt.Fprintf(f, "%s%s %s", finalStr, kindStr, name)
 	if extends != "" {
 		fmt.Fprintf(f, " extends %s", extends)
 	}
